@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "836583420251",
+    "project_id": "swiftloans-app",
+    "storage_bucket": "swiftloans-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:836583420251:android:f48de10b872f42babe2a7e",
+        "android_client_info": {
+          "package_name": "com.swiftloans.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB13EyRUWaeg3vXKtC3BXGxt6edG28fG3I"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

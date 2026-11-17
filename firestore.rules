@@ -1,0 +1,199 @@
+rules_version = '2';
+
+// SwiftLoans multiempresa.
+// - ROOT: dueño de la plataforma; crea empresas y ve todo.
+// - owner (dueño) / admin / collector (cobrador): solo su empresa.
+// - Solo el ROOT crea empresas. Cada empresa tiene un límite de usuarios
+//   (maxUsers) que solo el ROOT cambia; userCount nunca baja, así no se
+//   pueden "rotar" cuentas desactivando y creando otras.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function companyDoc(cid) {
+      return /databases/$(database)/documents/companies/$(cid);
+    }
+
+    function me() {
+      return get(userDoc(request.auth.uid)).data;
+    }
+
+    function hasProfile() {
+      return signedIn() && exists(userDoc(request.auth.uid));
+    }
+
+    function isRoot() {
+      return hasProfile() && me().role == 'root' && me().active == true;
+    }
+
+    // Usuario activo de una empresa activa.
+    function isMember(cid) {
+      return hasProfile()
+        && me().active == true
+        && me().companyId == cid
+        && get(companyDoc(cid)).data.active == true;
+    }
+
+    function fundAmount(cid, fundId) {
+      let path = /databases/$(database)/documents/companies/$(cid)/funds/$(fundId);
+      return exists(path) ? get(path).data.amount : 0;
+    }
+
+    function isManager(cid) {
+      return isMember(cid) && me().role in ['owner', 'admin'];
+    }
+
+    // Roles que cada quien puede asignar dentro de su empresa.
+    function assignableRoles() {
+      return me().role == 'owner' ? ['admin', 'collector'] : ['collector'];
+    }
+
+    // ---------- Candado del ROOT (solo puede existir uno) ----------
+    match /meta/root {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && !exists(/databases/$(database)/documents/meta/root)
+        && request.resource.data.uid == request.auth.uid
+        && getAfter(userDoc(request.auth.uid)).data.role == 'root';
+      allow update, delete: if isRoot();
+    }
+
+    // ---------- Empresas ----------
+    match /companies/{cid} {
+      allow read: if isRoot() || isMember(cid);
+      allow create, delete: if isRoot();
+
+      allow update: if isRoot()
+        // Al crear un empleado, el dueño/admin suma 1 al contador sin pasarse.
+        || (isManager(cid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['userCount'])
+          && request.resource.data.userCount == resource.data.userCount + 1
+          && request.resource.data.userCount <= resource.data.maxUsers);
+
+      // Pagos y préstamos son registros financieros: los miembros pueden
+      // crearlos y leerlos, pero nunca editarlos ni borrarlos. Lo pagado de
+      // cada préstamo se calcula a partir de los pagos.
+      // Cada pago/préstamo queda firmado por quien lo registra: nadie puede
+      // cargarle un cobro a otro usuario.
+      match /payments/{paymentId} {
+        allow read: if isRoot() || isMember(cid);
+        allow create: if (isRoot() || isMember(cid))
+          && request.resource.data.collectorUid == request.auth.uid;
+        allow update, delete: if isRoot();
+      }
+      match /loans/{loanId} {
+        allow read: if isRoot() || isMember(cid);
+        allow create: if (isRoot() || isMember(cid))
+          && request.resource.data.createdByUid == request.auth.uid;
+        allow update, delete: if isRoot();
+      }
+
+      // Gastos: firmados por quien los registra; solo dueño/admin (o ROOT)
+      // los pueden borrar para corregir un error. Nunca se editan.
+      match /expenses/{expenseId} {
+        allow read: if isRoot() || isMember(cid);
+        allow create: if (isRoot() || isMember(cid))
+          && request.resource.data.byUid == request.auth.uid
+          && request.resource.data.amount is number
+          && request.resource.data.amount > 0;
+        allow delete: if isRoot() || isManager(cid);
+      }
+
+      // Cuadres de caja: uno por usuario y día, firmado por quien lo cierra.
+      // No se editan; dueño/admin (o ROOT) solo lo marcan como revisado.
+      match /closings/{closingId} {
+        allow read: if isRoot() || isMember(cid);
+        allow create: if (isRoot() || isMember(cid))
+          && request.resource.data.byUid == request.auth.uid
+          && closingId.matches('C-[0-9]{8}-' + request.auth.uid)
+          && request.resource.data.status == 'pending'
+          // El fondo inicial es el que asignó el dueño/admin (o 0).
+          && request.resource.data.openingCash == fundAmount(cid, 'F' + closingId[1:]);
+        allow update: if (isRoot() || isManager(cid))
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['status', 'reviewedBy', 'reviewedAt'])
+          && request.resource.data.status == 'approved';
+        allow delete: if isRoot();
+      }
+
+      // Fondo inicial de cada usuario por día: solo dueño/admin (o ROOT).
+      match /funds/{fundId} {
+        allow read: if isRoot() || isMember(cid);
+        allow write: if (isRoot() || isManager(cid))
+          && (request.resource == null
+            || (request.resource.data.amount is number
+              && request.resource.data.amount >= 0));
+      }
+
+      // Ajustes de la empresa (recibo, préstamos por defecto, rutas): todos
+      // los leen; solo dueño/admin (o ROOT) los cambian.
+      match /settings/{doc} {
+        allow read: if isRoot() || isMember(cid);
+        allow write: if isRoot() || isManager(cid);
+      }
+
+      // Resto de datos de la empresa (clientes, contadores...).
+      // Ojo: {sub} obliga a que haya una subcolección. Un {document=**}
+      // directo también coincidiría con la empresa misma y dejaría a los
+      // miembros cambiar su límite de usuarios.
+      match /{sub}/{document=**} {
+        allow read: if isRoot() || isMember(cid);
+        allow write: if isRoot()
+          || (isMember(cid) && !(sub in ['payments', 'loans', 'expenses', 'closings', 'funds', 'settings']));
+      }
+    }
+
+    // ---------- Usuarios ----------
+    match /users/{uid} {
+      allow read: if signedIn() && (
+        request.auth.uid == uid
+        || isRoot()
+        || isManager(resource.data.companyId)
+      );
+
+      // Alta del ROOT (una sola vez, junto con /meta/root).
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role == 'root'
+        && !exists(/databases/$(database)/documents/meta/root)
+        && getAfter(/databases/$(database)/documents/meta/root).data.uid == uid;
+
+      // El ROOT crea cualquier usuario (p. ej. el dueño de una empresa nueva).
+      allow create: if isRoot();
+
+      // Dueño/admin crea empleados de SU empresa, con cupo disponible.
+      allow create: if isManager(request.resource.data.companyId)
+        && request.resource.data.companyId == me().companyId
+        && request.resource.data.role in assignableRoles()
+        && getAfter(companyDoc(me().companyId)).data.userCount
+             == get(companyDoc(me().companyId)).data.userCount + 1
+        && getAfter(companyDoc(me().companyId)).data.userCount
+             <= get(companyDoc(me().companyId)).data.maxUsers;
+
+      allow update: if isRoot()
+        // Dueño/admin activa o desactiva empleados que puede gestionar.
+        || (isManager(resource.data.companyId)
+          && resource.data.companyId == me().companyId
+          && resource.data.role in assignableRoles()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['active', 'name']))
+        // Cada usuario solo puede marcar que ya cambió su contraseña temporal.
+        || (request.auth.uid == uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['mustChangePassword'])
+          && request.resource.data.mustChangePassword == false);
+
+      allow delete: if isRoot();
+    }
+
+    // Cualquier otra cosa: solo ROOT.
+    match /{document=**} {
+      allow read, write: if isRoot();
+    }
+  }
+}
